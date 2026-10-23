@@ -17,6 +17,11 @@
     {% if count == 0 %}
       <p class="error">No matching images found. Try raising the threshold.</p>
     {% else %}
+      <div class="toolbar">
+        <a class="btn-download" href="{{ url_for('download_all', job_id=job_id) }}">
+          ⬇ Download all as ZIP
+        </a>
+      </div>
       <div class="grid">
         {% for r in results %}
           <figure class="card">
@@ -24,6 +29,9 @@
             <figcaption>
               <span class="name" title="{{ r.name }}">{{ r.name }}</span>
               <span class="score">dist {{ r.distance }} · query #{{ r.query_index }}</span>
+              <a class="card-download"
+                 href="{{ url_for('download_one', job_id=job_id, token=r.token) }}"
+                 download>Download</a>
             </figcaption>
           </figure>
         {% endfor %}

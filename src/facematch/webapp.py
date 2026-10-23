@@ -1,8 +1,8 @@
 """Small local web UI for FaceMatch.
 
 Upload a repository (a ``.zip`` of images, or point at a local folder path) plus
-one or more query face images, run the matcher, and view matches as thumbnails
-with their distance scores.
+one or more query face images, run the matcher as a background job, watch a live
+progress bar, and view matches as thumbnails with their distance scores.
 
 Runs on 127.0.0.1 only — this tool processes biometric data and must not be
 exposed on a network. See ``NOTICE.md``.
@@ -11,42 +11,70 @@ exposed on a network. See ``NOTICE.md``.
 from __future__ import annotations
 
 import io
+import os
+import threading
 import tempfile
 import uuid
 import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional
 
 from flask import (
     Flask,
     abort,
+    jsonify,
     render_template,
     request,
     send_file,
     url_for,
 )
 
-from .engine import DEFAULT_THRESHOLD, FaceMatcher
+from .engine import DEFAULT_THRESHOLD, FaceMatcher, MatchResult
 from .sources import IMAGE_EXTENSIONS, resolve_repository
 
 # Upload / request guards.
 MAX_CONTENT_LENGTH = 512 * 1024 * 1024  # 512 MB total request cap
 THUMBNAIL_MAX = (256, 256)
 
-# In-memory map of run id -> {image name -> absolute path on disk}, so the
-# thumbnail route can only ever serve files this process produced as matches.
-_RUNS: Dict[str, Dict[str, Path]] = {}
+
+@dataclass
+class Job:
+    """State for one background search job."""
+
+    id: str
+    status: str = "starting"  # starting | preparing | scanning | done | error
+    processed: int = 0
+    total: int = 0
+    error: Optional[str] = None
+    threshold: float = DEFAULT_THRESHOLD
+    results: List[MatchResult] = field(default_factory=list)
+    # token -> absolute path, so the thumbnail route only serves match files.
+    files: Dict[str, Path] = field(default_factory=dict)
+
+    def as_status(self) -> dict:
+        pct = int(self.processed / self.total * 100) if self.total else 0
+        return {
+            "status": self.status,
+            "processed": self.processed,
+            "total": self.total,
+            "percent": pct,
+            "error": self.error,
+        }
 
 
-def _save_uploads(files, dest: Path) -> list[Path]:
+_JOBS: Dict[str, Job] = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _save_uploads(files, dest: Path) -> List[Path]:
     """Persist uploaded query images into ``dest``; return their paths."""
     dest.mkdir(parents=True, exist_ok=True)
-    saved: list[Path] = []
+    saved: List[Path] = []
     for f in files:
         if not f or not f.filename:
             continue
-        # Keep only the basename to avoid directory traversal from the filename.
-        name = Path(f.filename).name
+        name = Path(f.filename).name  # basename only — no traversal
         if Path(name).suffix.lower() not in IMAGE_EXTENSIONS:
             continue
         target = dest / name
@@ -55,21 +83,59 @@ def _save_uploads(files, dest: Path) -> list[Path]:
     return saved
 
 
-def _resolve_repo_from_request(req, workdir: Path) -> Path:
-    """Resolve the repository from either an uploaded zip or a folder path."""
-    upload = req.files.get("repo_zip")
+def _resolve_repo(upload, repo_path: str, workdir: Path) -> Path:
+    """Resolve the repository from an uploaded zip or a folder path string."""
     if upload and upload.filename:
         if not upload.filename.lower().endswith(".zip"):
             raise ValueError("Repository upload must be a .zip file.")
         zip_path = workdir / "repo.zip"
         upload.save(str(zip_path))
         return resolve_repository(str(zip_path), workdir=workdir)
-
-    folder = (req.form.get("repo_path") or "").strip()
+    folder = (repo_path or "").strip()
     if folder:
         return resolve_repository(folder, workdir=workdir)
-
     raise ValueError("Provide a repository: upload a .zip or enter a folder path.")
+
+
+def _run_job(job: Job, repo_dir: Path, query_paths: List[Path]) -> None:
+    """Background worker: run the match, updating job progress as it goes."""
+    try:
+        job.status = "scanning"
+
+        def on_progress(processed: int, total: int) -> None:
+            job.processed = processed
+            job.total = total
+
+        # Cache encodings next to the repo so repeat searches of the same
+        # library (e.g. a different person) skip re-encoding. Parallelise the
+        # encode step across CPU cores for large repositories.
+        cache_path = repo_dir / ".facematch_cache.json"
+        workers = max(1, (os.cpu_count() or 1))
+        matcher = FaceMatcher(
+            threshold=job.threshold, cache_path=cache_path, workers=workers
+        )
+        try:
+            matcher.load_cache()
+        except Exception:
+            pass
+
+        results = matcher.match(
+            repo_dir, query_paths, progress=False, on_progress=on_progress
+        )
+
+        try:
+            matcher.save_cache()
+        except Exception:
+            pass
+
+        for i, r in enumerate(results):
+            token = f"{i}_{r.path.name}"
+            job.files[token] = r.path
+        job.results = results
+        job.status = "done"
+    except Exception as exc:  # surface any failure to the UI
+        job.error = str(exc)
+        job.status = "error"
 
 
 def create_app() -> Flask:
@@ -84,11 +150,7 @@ def create_app() -> Flask:
     def search():
         queries = request.files.getlist("queries")
         if not queries or all(not q.filename for q in queries):
-            return render_template(
-                "index.html",
-                default_threshold=DEFAULT_THRESHOLD,
-                error="Upload at least one query face image.",
-            )
+            return jsonify(error="Upload at least one query face image."), 400
 
         try:
             threshold = float(request.form.get("threshold", DEFAULT_THRESHOLD))
@@ -97,49 +159,68 @@ def create_app() -> Flask:
 
         workdir = Path(tempfile.mkdtemp(prefix="facematch_web_"))
         try:
-            repo_dir = _resolve_repo_from_request(request, workdir)
+            repo_dir = _resolve_repo(
+                request.files.get("repo_zip"),
+                request.form.get("repo_path", ""),
+                workdir,
+            )
             query_paths = _save_uploads(queries, workdir / "queries")
             if not query_paths:
                 raise ValueError("No valid query images (supported: images only).")
-
-            matcher = FaceMatcher(threshold=threshold, cache_path=None)
-            results = matcher.match(repo_dir, query_paths, progress=False)
         except (ValueError, FileNotFoundError, RuntimeError) as exc:
-            return render_template(
-                "index.html",
-                default_threshold=DEFAULT_THRESHOLD,
-                error=str(exc),
-            )
+            return jsonify(error=str(exc)), 400
 
-        run_id = uuid.uuid4().hex
-        _RUNS[run_id] = {}
+        job = Job(id=uuid.uuid4().hex, status="preparing", threshold=threshold)
+        with _JOBS_LOCK:
+            _JOBS[job.id] = job
+        thread = threading.Thread(
+            target=_run_job, args=(job, repo_dir, query_paths), daemon=True
+        )
+        thread.start()
+        return jsonify(job_id=job.id)
+
+    @app.get("/progress/<job_id>")
+    def progress(job_id: str):
+        job = _JOBS.get(job_id)
+        if not job:
+            abort(404)
+        return jsonify(job.as_status())
+
+    @app.get("/results/<job_id>")
+    def results(job_id: str):
+        job = _JOBS.get(job_id)
+        if not job:
+            abort(404)
+        if job.status == "error":
+            return render_template(
+                "index.html", default_threshold=DEFAULT_THRESHOLD, error=job.error
+            )
         view = []
-        for i, r in enumerate(results):
+        for i, r in enumerate(job.results):
             token = f"{i}_{r.path.name}"
-            _RUNS[run_id][token] = r.path
             view.append(
                 {
                     "token": token,
                     "name": r.path.name,
                     "distance": round(r.distance, 4),
                     "query_index": r.query_index,
-                    "thumb_url": url_for("thumb", run_id=run_id, token=token),
+                    "thumb_url": url_for("thumb", job_id=job_id, token=token),
                 }
             )
-
         return render_template(
             "results.html",
             results=view,
             count=len(view),
-            threshold=threshold,
+            threshold=job.threshold,
+            job_id=job_id,
         )
 
-    @app.get("/thumb/<run_id>/<token>")
-    def thumb(run_id: str, token: str):
-        run = _RUNS.get(run_id)
-        if not run or token not in run:
+    @app.get("/thumb/<job_id>/<token>")
+    def thumb(job_id: str, token: str):
+        job = _JOBS.get(job_id)
+        if not job or token not in job.files:
             abort(404)
-        path = run[token]
+        path = job.files[token]
         try:
             from PIL import Image  # type: ignore
 
@@ -151,8 +232,52 @@ def create_app() -> Flask:
             buf.seek(0)
             return send_file(buf, mimetype=f"image/{fmt.lower()}")
         except Exception:
-            # Fall back to serving the original file if Pillow is unavailable.
             return send_file(str(path))
+
+    @app.get("/download/<job_id>/<token>")
+    def download_one(job_id: str, token: str):
+        """Download a single matched image at full resolution."""
+        job = _JOBS.get(job_id)
+        if not job or token not in job.files:
+            abort(404)
+        path = job.files[token]
+        return send_file(
+            str(path), as_attachment=True, download_name=path.name
+        )
+
+    @app.get("/download/<job_id>")
+    def download_all(job_id: str):
+        """Download every matched image for a job as a single ZIP."""
+        job = _JOBS.get(job_id)
+        if not job:
+            abort(404)
+        if not job.files:
+            abort(404)
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            used: Dict[str, int] = {}
+            for path in job.files.values():
+                # De-duplicate names inside the archive (two folders may share a
+                # filename) by suffixing a counter.
+                name = path.name
+                if name in used:
+                    used[name] += 1
+                    stem, dot, ext = name.partition(".")
+                    name = f"{stem}_{used[path.name]}{dot}{ext}"
+                else:
+                    used[name] = 0
+                try:
+                    zf.write(str(path), arcname=name)
+                except OSError:
+                    continue
+        buf.seek(0)
+        return send_file(
+            buf,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=f"facematch_{job_id[:8]}.zip",
+        )
 
     return app
 
@@ -175,7 +300,8 @@ def main(argv=None) -> int:
             "biometric data and must stay local."
         )
 
-    create_app().run(host=args.host, port=args.port, debug=args.debug)
+    # threaded=True so progress polling works while a job runs.
+    create_app().run(host=args.host, port=args.port, debug=args.debug, threaded=True)
     return 0
 
 

@@ -83,3 +83,113 @@ def test_match_result_as_dict():
     r = MatchResult(path=Path("/tmp/a.jpg"), distance=0.12345, query_index=1)
     d = r.as_dict()
     assert d == {"path": "/tmp/a.jpg", "distance": 0.1235, "query_index": 1}
+
+
+def test_parallel_matches_serial(tmp_path: Path, monkeypatch):
+    """The parallel path must produce identical results to the serial path."""
+    import facematch.engine as engine
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    names = [f"img{i}.jpg" for i in range(6)]
+    for n in names:
+        (repo / n).write_bytes(b"x")
+
+    query = np.zeros(128)
+
+    # Deterministic synthetic encodings keyed by filename: even-indexed images
+    # are a match (distance 0), odd-indexed are far away.
+    def enc_for(name: str):
+        idx = int(name.replace("img", "").replace(".jpg", ""))
+        if idx % 2 == 0:
+            return [np.zeros(128)]
+        far = np.zeros(128)
+        far[0] = 5.0
+        return [far]
+
+    # Serial path: monkeypatch the method.
+    def fake_encode_image(self, path):
+        return enc_for(Path(path).name)
+
+    monkeypatch.setattr(engine.FaceMatcher, "encode_image", fake_encode_image)
+    monkeypatch.setattr(
+        engine.FaceMatcher, "encode_queries", lambda self, qs: [query]
+    )
+
+    serial = engine.FaceMatcher(threshold=0.6, workers=1)
+    serial_results = serial.match(repo, [Path("q.jpg")], progress=False)
+
+    # Parallel path: monkeypatch the module-level worker (runs in-process here
+    # because we also force a thread-free code path via workers>1 + patched
+    # _encode_file). We patch ProcessPoolExecutor to a synchronous shim so the
+    # patched worker is actually used without real subprocesses.
+    def fake_encode_file(path_str, model):
+        encs = enc_for(Path(path_str).name)
+        return path_str, [e.tolist() for e in encs], 1.0, 1
+
+    monkeypatch.setattr(engine, "_encode_file", fake_encode_file)
+
+    class _SyncPool:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def submit(self, fn, *args):
+            class _F:
+                def __init__(self, v):
+                    self._v = v
+
+                def result(self):
+                    return self._v
+
+            return _F(fn(*args))
+
+    monkeypatch.setattr(engine, "ProcessPoolExecutor", _SyncPool)
+    monkeypatch.setattr(engine, "as_completed", lambda futs: list(futs))
+
+    parallel = engine.FaceMatcher(threshold=0.6, workers=4)
+    parallel_results = parallel.match(repo, [Path("q.jpg")], progress=False)
+
+    assert [r.path.name for r in serial_results] == [
+        r.path.name for r in parallel_results
+    ]
+    assert [round(r.distance, 6) for r in serial_results] == [
+        round(r.distance, 6) for r in parallel_results
+    ]
+    # Sanity: exactly the 3 even-indexed images matched.
+    assert sorted(r.path.name for r in parallel_results) == [
+        "img0.jpg",
+        "img2.jpg",
+        "img4.jpg",
+    ]
+
+
+def test_progress_monotonic(tmp_path: Path, monkeypatch):
+    import facematch.engine as engine
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for i in range(4):
+        (repo / f"p{i}.jpg").write_bytes(b"x")
+
+    monkeypatch.setattr(
+        engine.FaceMatcher, "encode_image", lambda self, p: [np.zeros(128)]
+    )
+    monkeypatch.setattr(
+        engine.FaceMatcher, "encode_queries", lambda self, qs: [np.zeros(128)]
+    )
+
+    seen = []
+    m = engine.FaceMatcher(threshold=0.6, workers=1)
+    m.match(repo, [Path("q.jpg")], progress=False, on_progress=lambda p, t: seen.append((p, t)))
+
+    assert seen[0] == (0, 4)
+    assert seen[-1] == (4, 4)
+    # processed counts never decrease
+    processed = [p for p, _ in seen]
+    assert processed == sorted(processed)

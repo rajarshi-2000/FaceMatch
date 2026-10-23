@@ -18,7 +18,7 @@
 
     {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
-    <form action="{{ url_for('search') }}" method="post" enctype="multipart/form-data">
+    <form id="search-form" action="{{ url_for('search') }}" method="post" enctype="multipart/form-data">
       <fieldset>
         <legend>1. Image repository</legend>
         <label>Upload a .zip of images
@@ -45,8 +45,95 @@
         </label>
       </fieldset>
 
-      <button type="submit">Search</button>
+      <button type="submit" id="submit-btn">Search</button>
     </form>
+
+    <div id="progress-panel" class="progress-panel" hidden>
+      <p id="progress-label" class="progress-label">Preparing…</p>
+      <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
+      <p id="progress-count" class="progress-count"></p>
+    </div>
+
+    <p id="form-error" class="error" hidden></p>
   </main>
+
+  <script>
+    (function () {
+      const form = document.getElementById("search-form");
+      const btn = document.getElementById("submit-btn");
+      const panel = document.getElementById("progress-panel");
+      const bar = document.getElementById("progress-bar");
+      const label = document.getElementById("progress-label");
+      const count = document.getElementById("progress-count");
+      const errBox = document.getElementById("form-error");
+
+      function showError(msg) {
+        errBox.textContent = msg;
+        errBox.hidden = false;
+        panel.hidden = true;
+        btn.disabled = false;
+        btn.textContent = "Search";
+      }
+
+      function setIndeterminate(text) {
+        label.textContent = text;
+        bar.classList.add("indeterminate");
+        bar.style.width = "100%";
+        count.textContent = "";
+      }
+
+      function setProgress(processed, total, pct) {
+        bar.classList.remove("indeterminate");
+        label.textContent = "Scanning images…";
+        bar.style.width = pct + "%";
+        count.textContent = processed + " / " + total + " images (" + pct + "%)";
+      }
+
+      form.addEventListener("submit", async function (e) {
+        e.preventDefault();
+        errBox.hidden = true;
+        btn.disabled = true;
+        btn.textContent = "Working…";
+        panel.hidden = false;
+        setIndeterminate("Uploading & preparing…");
+
+        let resp;
+        try {
+          resp = await fetch(form.action, { method: "POST", body: new FormData(form) });
+        } catch (ex) {
+          return showError("Network error: " + ex);
+        }
+        if (!resp.ok) {
+          const data = await resp.json().catch(() => ({}));
+          return showError(data.error || ("Request failed (" + resp.status + ")"));
+        }
+        const { job_id } = await resp.json();
+
+        const poll = setInterval(async function () {
+          let s;
+          try {
+            s = await (await fetch("/progress/" + job_id)).json();
+          } catch (ex) {
+            return; // transient; keep polling
+          }
+          if (s.status === "error") {
+            clearInterval(poll);
+            return showError(s.error || "Search failed.");
+          }
+          if (s.status === "scanning" && s.total > 0) {
+            setProgress(s.processed, s.total, s.percent);
+          } else if (s.status === "preparing" || s.status === "starting") {
+            setIndeterminate("Preparing repository & query faces…");
+          }
+          if (s.status === "done") {
+            clearInterval(poll);
+            label.textContent = "Done — loading results…";
+            bar.style.width = "100%";
+            window.location = "/results/" + job_id;
+          }
+        }, 500);
+      });
+    })();
+  </script>
 </body>
 </html>

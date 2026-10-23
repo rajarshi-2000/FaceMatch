@@ -67,6 +67,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress the progress bar.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel worker processes for encoding (default 1; "
+        "try your CPU core count for a large repository).",
+    )
     return parser
 
 
@@ -90,6 +97,7 @@ def main(argv: List[str] | None = None) -> int:
         model=args.model,
         threshold=args.threshold,
         cache_path=cache_path,
+        workers=max(1, args.workers),
     )
     if cache_path:
         matcher.load_cache()
