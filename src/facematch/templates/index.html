@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FaceMatch</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <main class="container">
+    <h1>FaceMatch</h1>
+    <p class="subtitle">Find photos of a person inside an image repository — fully local.</p>
+
+    <p class="notice">
+      Only use images you own or have consent for. Do not use this to identify
+      or track people without their consent.
+    </p>
+
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+    <form action="{{ url_for('search') }}" method="post" enctype="multipart/form-data">
+      <fieldset>
+        <legend>1. Image repository</legend>
+        <label>Upload a .zip of images
+          <input type="file" name="repo_zip" accept=".zip" />
+        </label>
+        <p class="or">— or —</p>
+        <label>Local folder path
+          <input type="text" name="repo_path" placeholder="/path/to/photos" />
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>2. Query face(s)</legend>
+        <label>Reference image(s) of the person to find
+          <input type="file" name="queries" accept="image/*" multiple required />
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>3. Threshold</legend>
+        <label>Match strictness (lower = stricter, default {{ default_threshold }})
+          <input type="number" name="threshold" step="0.01" min="0.1" max="1.0"
+                 value="{{ default_threshold }}" />
+        </label>
+      </fieldset>
+
+      <button type="submit">Search</button>
+    </form>
+  </main>
+</body>
+</html>

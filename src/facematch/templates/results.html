@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FaceMatch — results</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <main class="container">
+    <h1>Results</h1>
+    <p class="subtitle">
+      {{ count }} match{{ '' if count == 1 else 'es' }} at threshold {{ threshold }}.
+      <a href="{{ url_for('index') }}">New search</a>
+    </p>
+
+    {% if count == 0 %}
+      <p class="error">No matching images found. Try raising the threshold.</p>
+    {% else %}
+      <div class="grid">
+        {% for r in results %}
+          <figure class="card">
+            <img src="{{ r.thumb_url }}" alt="{{ r.name }}" loading="lazy" />
+            <figcaption>
+              <span class="name" title="{{ r.name }}">{{ r.name }}</span>
+              <span class="score">dist {{ r.distance }} · query #{{ r.query_index }}</span>
+            </figcaption>
+          </figure>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </main>
+</body>
+</html>
